@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/mdrakib/tds-auth-proxy/internal/auth"
@@ -266,4 +267,56 @@ func (s *Session) envChange(tk protocol.Token) error {
 		s.Database = protocol.EnvString(ec.NewValue)
 	}
 	return nil
+}
+
+// SQL Server login errors that mean the credentials themselves were refused.
+// 18456 is also sent after errors such as 4060 (cannot open the requested
+// database), which are about the client's request, not the credentials.
+var credentialErrors = map[int32]bool{
+	18456: true, // login failed (wrong password, unknown login, ...)
+	18452: true, // untrusted domain: integrated authentication failed
+	18470: true, // account disabled
+	18486: true, // account locked out
+	18487: true, // password expired
+	18488: true, // password must be changed
+}
+
+var notCredentialErrors = map[int32]bool{
+	4060: true, // cannot open database requested by the login
+	4064: true, // cannot open user default database
+}
+
+// kdcCredentialErrors are Kerberos KDC replies to a bad, expired or revoked
+// client credential. Each of them may count towards an AD lockout.
+var kdcCredentialErrors = []string{
+	"KDC_ERR_PREAUTH_FAILED",
+	"KDC_ERR_KEY_EXPIRED",
+	"KDC_ERR_CLIENT_REVOKED",
+	"KDC_ERR_C_PRINCIPAL_UNKNOWN",
+}
+
+// CredentialsRejected reports whether err from Connect means the backend
+// (or the KDC) refused the credentials, as opposed to a network, TLS or
+// request problem.
+func CredentialsRejected(err error) bool {
+	var le *LoginError
+	if errors.As(err, &le) {
+		rejected := false
+		for _, m := range le.Messages {
+			if notCredentialErrors[m.Number] {
+				return false
+			}
+			rejected = rejected || credentialErrors[m.Number]
+		}
+		return rejected
+	}
+	if errors.Is(err, ErrLogin) {
+		s := err.Error()
+		for _, code := range kdcCredentialErrors {
+			if strings.Contains(s, code) {
+				return true
+			}
+		}
+	}
+	return false
 }

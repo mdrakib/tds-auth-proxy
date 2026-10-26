@@ -19,6 +19,13 @@ server:
   auth_failure_delay: 1s        # delay before reporting a failed login
   max_concurrent_hashes: 4      # parallel Argon2id verifications (~19 MiB each by default)
   allowed_cidrs: []             # e.g. [10.8.0.0/24] (WireGuard); empty = any
+  lockout_protection:           # protects the backend accounts from lockout
+    enabled: true               # after the backend rejects a profile's password, stop
+                                # using it until the secret changes (or a reload)
+    max_parallel_logins: 2      # concurrent backend logins per profile = worst-case failed
+                                # attempts when a password expires mid-burst
+    retry_interval: 0s          # >0: one trial login with the rejected, unchanged
+                                # secret per interval; 0 = wait for a new secret
 
 logging:
   level: info                   # debug | info | warn | error

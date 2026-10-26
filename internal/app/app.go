@@ -23,6 +23,7 @@ type App struct {
 	logger  *slog.Logger
 	level   *slog.LevelVar
 	store   *credentials.Store
+	guard   *credentials.Guard
 	state   atomic.Pointer[session.State]
 	ready   atomic.Bool
 	reload  sync.Mutex
@@ -47,7 +48,14 @@ func New(path string, logger *slog.Logger, level *slog.LevelVar) (*App, error) {
 	}
 	a.state.Store(st)
 	a.setLevel(cfg)
-	handler := &session.Handler{State: a.state.Load, Metrics: a.Metrics, Logger: logger}
+	a.guard = credentials.NewGuard()
+	a.guard.OnChange = func(profile string, blocked bool) {
+		a.Metrics.SetCredentialsBlocked(profile, blocked)
+		if !blocked {
+			logger.Info("backend logins resumed for credential profile", "event", "backend_credentials_unblocked", "profile", profile)
+		}
+	}
+	handler := &session.Handler{State: a.state.Load, Metrics: a.Metrics, Logger: logger, Guard: a.guard}
 	a.srv = &listener.Server{Handler: handler, Metrics: a.Metrics, Logger: logger}
 	a.admin = &monitoring.AdminServer{Metrics: a.Metrics, Ready: &a.ready, Reload: a.Reload, Logger: logger}
 	return a, nil
@@ -96,6 +104,9 @@ func (a *App) Reload() error {
 			warnRestartRequired(a.logger, a.state.Load().Config, cfg)
 			a.state.Store(st)
 			a.setLevel(cfg)
+			// A reload is the operator's way to retry blocked credentials
+			// (e.g. after unlocking the account without changing the secret).
+			a.guard.Reset()
 			a.logger.Info("configuration reloaded", "event", "config_reloaded", "users", st.Auth.UserCount(), "backends", len(st.Backends))
 			return nil
 		}

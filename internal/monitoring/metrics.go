@@ -24,6 +24,7 @@ type Metrics struct {
 	mu              sync.Mutex
 	authResults     map[string]int64 // outcome -> count
 	backendFailures map[string]int64 // backend/category -> count
+	blockedCreds    map[string]bool  // credential profile -> blocked
 
 	HandshakeDuration *Histogram
 	SessionDuration   *Histogram
@@ -33,6 +34,7 @@ func NewMetrics() *Metrics {
 	return &Metrics{
 		authResults:       map[string]int64{},
 		backendFailures:   map[string]int64{},
+		blockedCreds:      map[string]bool{},
 		HandshakeDuration: NewHistogram([]float64{0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30}),
 		SessionDuration:   NewHistogram([]float64{1, 10, 60, 300, 900, 1800, 3600, 4 * 3600, 12 * 3600}),
 	}
@@ -50,6 +52,14 @@ func (m *Metrics) AuthResult(outcome string) {
 func (m *Metrics) BackendFailure(backend, category string) {
 	m.mu.Lock()
 	m.backendFailures[backend+"\x00"+category]++
+	m.mu.Unlock()
+}
+
+// SetCredentialsBlocked records whether lockout protection is pausing logins
+// for a credential profile.
+func (m *Metrics) SetCredentialsBlocked(profile string, blocked bool) {
+	m.mu.Lock()
+	m.blockedCreds[profile] = blocked
 	m.mu.Unlock()
 }
 
@@ -92,6 +102,19 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 			}
 		}
 		fmt.Fprintf(w, "tdsproxy_backend_failures_total{backend=%q,category=%q} %d\n", b, c, m.backendFailures[k])
+	}
+	fmt.Fprintf(w, "# HELP tdsproxy_credentials_blocked 1 while backend logins with a credential profile are paused after the server rejected it.\n# TYPE tdsproxy_credentials_blocked gauge\n")
+	profiles := make([]string, 0, len(m.blockedCreds))
+	for p := range m.blockedCreds {
+		profiles = append(profiles, p)
+	}
+	sort.Strings(profiles)
+	for _, p := range profiles {
+		v := 0
+		if m.blockedCreds[p] {
+			v = 1
+		}
+		fmt.Fprintf(w, "tdsproxy_credentials_blocked{profile=%q} %d\n", p, v)
 	}
 	m.mu.Unlock()
 

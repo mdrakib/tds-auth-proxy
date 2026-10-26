@@ -40,7 +40,26 @@ type Server struct {
 	// MaxConcurrentHashes bounds concurrent Argon2id verifications, which
 	// are deliberately memory hungry.
 	MaxConcurrentHashes int `yaml:"max_concurrent_hashes"`
+	// LockoutProtection pauses backend logins with credentials the backend
+	// has rejected, so a stale password cannot lock the account.
+	LockoutProtection LockoutProtection `yaml:"lockout_protection"`
 }
+
+type LockoutProtection struct {
+	// Enabled defaults to true.
+	Enabled *bool `yaml:"enabled"`
+	// MaxParallelLogins bounds concurrent backend logins per credential
+	// profile once its credentials are confirmed, and so the failed
+	// attempts made if the password expires while logins are in flight.
+	// Unconfirmed credentials are always tried one login at a time.
+	MaxParallelLogins int `yaml:"max_parallel_logins"`
+	// RetryInterval, when non-zero, allows one trial login with rejected,
+	// unchanged credentials per interval. Zero waits for the secret to
+	// change (or a configuration reload).
+	RetryInterval time.Duration `yaml:"retry_interval"`
+}
+
+func (l LockoutProtection) IsEnabled() bool { return l.Enabled == nil || *l.Enabled }
 
 type Logging struct {
 	Level string `yaml:"level"` // debug, info, warn, error
@@ -169,6 +188,9 @@ func (c *Config) applyDefaults() {
 	if s.MaxConcurrentHashes == 0 {
 		s.MaxConcurrentHashes = 4
 	}
+	if s.LockoutProtection.MaxParallelLogins == 0 {
+		s.LockoutProtection.MaxParallelLogins = 2
+	}
 	if c.Logging.Level == "" {
 		c.Logging.Level = "info"
 	}
@@ -210,6 +232,9 @@ func (c *Config) Validate() error {
 
 	if c.Server.MaxConnections < 0 || c.Server.MaxConcurrentHashes < 0 {
 		add("server: limits must be positive")
+	}
+	if lp := c.Server.LockoutProtection; lp.RetryInterval < 0 || lp.MaxParallelLogins < 0 {
+		add("server.lockout_protection: retry_interval and max_parallel_logins must not be negative")
 	}
 	if _, err := ParseCIDRs(c.Server.AllowedCIDRs); err != nil {
 		add("server.allowed_cidrs: %v", err)

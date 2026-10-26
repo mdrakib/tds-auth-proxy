@@ -461,6 +461,18 @@ func TestRealSQLServer(t *testing.T) {
 		}
 	})
 
+	t.Run("missing database does not trigger lockout protection", func(t *testing.T) {
+		// SQL Server answers 4060 followed by 18456: a client error, not a
+		// credential problem.
+		err := ping(s.viaProxy("main", "dev1", clientPW, "database", "no_such_db_it"))
+		if err == nil {
+			t.Fatal("expected failure for a missing database")
+		}
+		if err := ping(s.viaProxy("main", "dev1", clientPW)); err != nil {
+			t.Fatalf("credentials blocked after a missing-database error: %v", err)
+		}
+	})
+
 	t.Run("password rotation", func(t *testing.T) {
 		held, err := db.Conn(context.Background())
 		if err != nil {
@@ -473,6 +485,11 @@ func TestRealSQLServer(t *testing.T) {
 		err = ping(s.viaProxy("main", "dev1", clientPW))
 		if sqlErrNumber(err) != 18456 || !strings.Contains(err.Error(), "could not log in to backend server 'main'") {
 			t.Fatalf("stale backend password: got %v", err)
+		}
+		// Lockout protection: no further attempt with the stale password.
+		err = ping(s.viaProxy("main", "dev1", clientPW))
+		if err == nil || !strings.Contains(err.Error(), "waiting for a new password") {
+			t.Fatalf("expected paused backend logins, got %v", err)
 		}
 
 		s.rotateSecret("Backend-v2-Pa55!")

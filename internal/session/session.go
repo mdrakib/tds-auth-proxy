@@ -17,6 +17,7 @@ import (
 
 	"github.com/mdrakib/tds-auth-proxy/internal/auth"
 	"github.com/mdrakib/tds-auth-proxy/internal/backend"
+	"github.com/mdrakib/tds-auth-proxy/internal/credentials"
 	"github.com/mdrakib/tds-auth-proxy/internal/monitoring"
 	"github.com/mdrakib/tds-auth-proxy/internal/protocol"
 	"github.com/mdrakib/tds-auth-proxy/internal/relay"
@@ -33,6 +34,8 @@ type Handler struct {
 	State   func() *State
 	Metrics *monitoring.Metrics
 	Logger  *slog.Logger
+	// Guard pauses logins with rejected backend credentials; nil disables it.
+	Guard *credentials.Guard
 }
 
 // sessionError is a failure during the login phase. clientMsg is what the
@@ -234,8 +237,35 @@ func (c *conn) establish(ctx context.Context) (*established, error) {
 		c.h.Metrics.BackendFailure(b.Name, "credentials")
 		return nil, fail("backend_credentials", errLoginFailed, backendFailedMsg(b.Name), err)
 	}
+	var ticket *credentials.Ticket
+	if lp := c.st.Config.Server.LockoutProtection; c.h.Guard != nil && lp.IsEnabled() {
+		ticket, err = c.h.Guard.Acquire(ctx, b.Profile, creds, lp.MaxParallelLogins, lp.RetryInterval)
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, fail("handshake_timeout", 0, "", fmt.Errorf("waiting for backend credential check: %w", err))
+			}
+			c.h.Metrics.BackendFailure(b.Name, "credentials_blocked")
+			c.log = c.log.With("client_user", u.Name, "backend", b.Name, "backend_user", creds.Identity())
+			return nil, fail("backend_credentials_blocked", errLoginFailed,
+				fmt.Sprintf("Login failed: the proxy's credentials for backend server '%s' were rejected and it is waiting for a new password. Contact the proxy administrator.", b.Name), err)
+		}
+	}
+	// Releases the login slot even if Connect panics; a no-op after Done.
+	defer ticket.Done(credentials.Inconclusive)
 	up := upstreamLogin(login, b.Host)
 	sess, err := backend.Connect(ctx, b.Target, creds, up, mars)
+	outcome := credentials.Accepted
+	if err != nil {
+		outcome = credentials.Inconclusive
+		if backend.CredentialsRejected(err) {
+			outcome = credentials.Rejected
+		}
+	}
+	if ticket.Done(outcome) {
+		c.log.Error("backend rejected the proxy's credentials; new logins with them are paused until the secret changes",
+			"event", "backend_credentials_blocked",
+			"backend", b.Name, "profile", b.Profile, "backend_user", creds.Identity(), "error", err.Error())
+	}
 	if err != nil {
 		cat, num := backendCategory(err)
 		c.h.Metrics.BackendFailure(b.Name, cat)

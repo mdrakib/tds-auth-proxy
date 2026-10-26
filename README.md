@@ -161,11 +161,52 @@ Important details:
 - A wrong new password gives clients `Login failed: the proxy could not log in to
   backend server '<name>'` and the log shows the backend's own error
   (`event=login_failed category=backend_login error="backend rejected login: error 18456 …"`).
+  Lockout protection (below) then stops further attempts with that password.
 - SQL Server itself rejects `sp_reset_connection` on a pooled session after that
   **SQL login's** password changed (verified directly against SQL Server 2022,
   without the proxy). Client connection pools therefore discard such sessions on
   reuse and open new ones, which use the new password. Sessions that are not
   reset are unaffected.
+
+### Lockout protection
+
+When a backend password expires or is changed before the proxy's secret is
+updated, every new client connection would otherwise try the stale password and
+could lock the account. `server.lockout_protection` (on by default) prevents this:
+
+- When the backend (or the Kerberos KDC) **rejects the credentials**, the proxy
+  stops logging in with them. New clients immediately get
+  `Login failed: the proxy's credentials for backend server '<name>' were rejected
+  and it is waiting for a new password` without the backend being contacted.
+  Sessions already open keep running.
+- Logins **resume automatically** as soon as the secret changes: the next client
+  connection notices the new file content (or keytab) and tries it.
+- New or not-yet-confirmed credentials (at startup, after a rotation or a reload)
+  are tried by **one connection at a time**; other clients wait for that result. A
+  wrong new password therefore costs exactly one failed attempt.
+- Once confirmed, at most `max_parallel_logins` (default 2) backend logins per
+  profile run at the same time. That is the worst-case number of failed attempts
+  when the password expires while clients are connecting. Set `1` for the
+  strictest guarantee; raise it if many clients connect at once and backend
+  logins are slow.
+- Counted as rejection: SQL Server errors 18456, 18452, 18470, 18486, 18487
+  (password expired), 18488 (must change) and Kerberos `KDC_ERR_PREAUTH_FAILED`,
+  `KDC_ERR_KEY_EXPIRED`, `KDC_ERR_CLIENT_REVOKED`, `KDC_ERR_C_PRINCIPAL_UNKNOWN`.
+  Not counted: network/TLS errors, timeouts, and a client requesting a database
+  it cannot open (4060/4064).
+- To retry the **same** secret (for example after an administrator unlocked the
+  account), reload the configuration (`SIGHUP` or `POST /-/reload`); this allows
+  one new attempt. `retry_interval` makes the proxy do this by itself, one trial
+  login per interval.
+- Watch for `event=backend_credentials_blocked` / `backend_credentials_unblocked`
+  in the log and the `tdsproxy_credentials_blocked{profile="…"}` metric (1 while
+  paused).
+
+With scheduled rotation (for example every 6 hours), update the secret file in the
+same step that changes the password. If the file is written **before** the
+password is changed on the server, the new password is rejected briefly and the
+profile stays paused until the next change; reload once, or set
+`retry_interval` (for example `10m`), to recover automatically.
 
 Configuration changes (users, profiles, backends, allowlists, the proxy TLS
 certificate, log level) are applied with `SIGHUP`
@@ -212,8 +253,9 @@ Admin HTTP server (`admin.listen`, loopback by default, no authentication):
 
 - `GET /healthz` – process alive. `GET /readyz` – listeners up and not shutting down.
 - `GET /metrics` – Prometheus text format: active sessions, connections,
-  rejections, client auth outcomes, backend failures by backend/category, bytes,
-  handshake and session duration histograms. No usernames or secrets.
+  rejections, client auth outcomes, backend failures by backend/category,
+  credential profiles paused by lockout protection, bytes, handshake and session
+  duration histograms. No usernames or secrets.
 - `POST /-/reload` – reload configuration.
 
 The container health check runs `tds-proxy healthcheck`.
@@ -287,6 +329,7 @@ the hash parameters and `max_concurrent_hashes`.
 | Client: `certificate verify failed` / `The certificate chain was issued by an authority that is not trusted` | Client must trust the issuer of `tls.client_certificate`, and connect using a name in its SAN. |
 | Client: `Login failed for user 'x'.` | Proxy log `login_failed` → `category`: `client_auth_invalid_credentials`, `client_auth_disabled`, `client_unauthorized` (user not in `allowed_backends`), `client_unsupported`. |
 | Client: `the proxy could not log in to backend server` | `category=backend_login`: backend rejected the credentials (rotate the secret file); `backend_credentials`: secret file missing/empty/unreadable. |
+| Client: `… were rejected and it is waiting for a new password` | Lockout protection paused the profile (`event=backend_credentials_blocked` shows the backend's error). Update the secret file; to retry the same secret, reload. |
 | Client: `could not reach backend server` | `backend_connect` (DNS/firewall), `backend_tls` (backend certificate name/CA — see `tls_server_name`, `ca_file`), `backend_protocol` (encryption refused, routing, MARS mismatch). |
 | Rotated secret not picked up in Docker | Directory vs. file mount (see above); file permissions for uid 65532. |
 | `client uses TDS 8.0 strict encryption` | Use `Encrypt=Mandatory`/`True` instead of `Strict`. |

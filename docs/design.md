@@ -25,6 +25,8 @@ accept ─ allowlist ─ connection slot
   ├─ LOGIN7 (≤128 KiB) → parse/validate → reject unsupported options
   ├─ Argon2id verify (bounded concurrency) → authorize listener's backend
   ├─ resolve credential profile (re-reads rotated secret files)
+  ├─ lockout guard: refuse if these exact credentials were rejected; otherwise wait
+  │                 for a login slot (1 while unverified, max_parallel_logins after)
   ├─ backend: dial → PRELOGIN (ENCRYPTION=ON, same MARS) → TLS client handshake (verify cert)
   │           → LOGIN7 built from the client's, credentials replaced → [SSPI rounds]
   │           → parse full login response, fail closed on anything unexpected
@@ -33,6 +35,15 @@ accept ─ allowlist ─ connection slot
 ```
 
 ## Key decisions
+
+**Never retry a rejected backend password.** `credentials.Guard` keys each
+profile's state on an in-memory HMAC (random per-process key) of the resolved
+credentials, so a new secret is recognised on the next connection without
+polling and the fingerprint is useless outside the process. State per profile:
+unverified (one login at a time) → confirmed (`max_parallel_logins`) → rejected
+(no backend contact until the fingerprint changes, a reload, or
+`retry_interval`). Only definite credential rejections block; ambiguous failures
+(network, TLS, 4060 missing database) leave the state unchanged.
 
 **Authenticate before contacting the backend.** The backend is dialled only for
 an authenticated, authorized client. Unauthenticated traffic cannot create load

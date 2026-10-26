@@ -7,3 +7,9 @@
 /tests/clients/dotnet/obj/
 /tests/clients/jdbc/*.jar
 /tests/clients/jdbc/*.class
+
+# Local proxy configuration and secrets
+/config.yml
+/config.yaml
+/secrets/
+/certs/

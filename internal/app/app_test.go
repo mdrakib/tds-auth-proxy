@@ -316,6 +316,103 @@ func TestBackendPasswordRotation(t *testing.T) {
 	}
 }
 
+func (e *env) failedBackendLogins() int {
+	e.fake.LoginsMu.Lock()
+	defer e.fake.LoginsMu.Unlock()
+	n := 0
+	for _, l := range e.fake.Logins {
+		if !l.OK {
+			n++
+		}
+	}
+	return n
+}
+
+func TestLockoutProtection(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	if err := pingErr(e.open("main", "dev1", clientPW)); err != nil {
+		t.Fatal(err)
+	}
+
+	// The password expires on the server; a burst of clients arrives.
+	e.fake.SetPassword("backend-password-v2")
+	var wg sync.WaitGroup
+	errs := make(chan error, 20)
+	for i := range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- pingErr(e.open([]string{"main", "other"}[i%2], "dev1", clientPW))
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err == nil {
+			t.Fatal("login succeeded with a stale backend password")
+		}
+	}
+	// At most max_parallel_logins (default 2) logins were in flight when
+	// the first rejection arrived; everything after it was refused locally.
+	burst := e.failedBackendLogins()
+	if burst < 1 || burst > 2 {
+		t.Fatalf("backend saw %d failed logins, want 1..2", burst)
+	}
+	err := pingErr(e.open("other", "dev1", clientPW))
+	if err == nil || !strings.Contains(err.Error(), "waiting for a new password") {
+		t.Fatalf("expected paused login, got %v", err)
+	}
+	if n := e.failedBackendLogins(); n != burst {
+		t.Fatalf("backend saw %d more failed logins while paused", n-burst)
+	}
+	var metrics strings.Builder
+	e.app.Metrics.WritePrometheus(&metrics)
+	if !strings.Contains(metrics.String(), `tdsproxy_credentials_blocked{profile="shared"} 1`) {
+		t.Fatal("blocked metric not set")
+	}
+
+	// A reload allows exactly one more attempt with the unchanged secret.
+	if err := e.app.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		pingErr(e.open("main", "dev1", clientPW))
+	}
+	if n := e.failedBackendLogins(); n != burst+1 {
+		t.Fatalf("after reload: %d failed logins, want %d", n, burst+1)
+	}
+
+	// The new secret arrives: logins resume without a restart.
+	e.rotateSecret("backend-password-v2")
+	if err := pingErr(e.open("main", "dev1", clientPW)); err != nil {
+		t.Fatalf("after rotation: %v", err)
+	}
+	metrics.Reset()
+	e.app.Metrics.WritePrometheus(&metrics)
+	if !strings.Contains(metrics.String(), `tdsproxy_credentials_blocked{profile="shared"} 0`) {
+		t.Fatal("blocked metric not cleared")
+	}
+}
+
+func TestLockoutProtectionUnverifiedSecret(t *testing.T) {
+	e := newEnv(t, envOpts{})
+	// A wrong secret is deployed before any login succeeded: of a burst of
+	// clients, only one reaches the backend.
+	e.rotateSecret("wrong")
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			pingErr(e.open("main", "dev1", clientPW))
+		}()
+	}
+	wg.Wait()
+	if n := e.failedBackendLogins(); n != 1 {
+		t.Fatalf("backend saw %d failed logins, want 1", n)
+	}
+}
+
 func TestNTLMBackendWithChannelBinding(t *testing.T) {
 	e := newEnv(t, envOpts{ntlm: true})
 	db := e.open("main", "dev1", clientPW)
