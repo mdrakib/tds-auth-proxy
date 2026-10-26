@@ -1,0 +1,39 @@
+# Production-oriented deployment of the proxy alone.
+#
+# Layout next to this file:
+#   config.yaml           proxy configuration (see config.example.yaml)
+#   secrets/              backend passwords and client password hashes, one
+#                         file each; rotate by writing a new file and renaming
+#                         it over the old one
+#   certs/                proxy.crt / proxy.key (+ CA for backend validation)
+#   krb5.conf             only for Kerberos profiles
+#
+# Reload configuration (users, profiles, backends, certificates) without a
+# restart:   docker compose kill -s HUP tds-proxy
+name: tds-auth-proxy
+
+services:
+  tds-proxy:
+    build: ..
+    image: tds-auth-proxy:latest
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    stop_grace_period: 30s   # > server.shutdown_timeout
+    ports:
+      # Publish on a private interface (e.g. a WireGuard address) rather than
+      # 0.0.0.0. Replace 127.0.0.1 accordingly.
+      - "127.0.0.1:14331:14331"
+      - "127.0.0.1:14332:14332"
+      - "127.0.0.1:14333:14333"
+      # Admin endpoints (health, metrics, reload): loopback only.
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./config.yaml:/etc/tds-proxy/config.yaml:ro
+      - ./secrets:/run/secrets:ro
+      - ./certs:/certs:ro
+      # - ./krb5.conf:/etc/krb5.conf:ro
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}

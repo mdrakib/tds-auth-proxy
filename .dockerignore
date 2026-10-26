@@ -1,0 +1,7 @@
+*
+!go.mod
+!go.sum
+!cmd
+!internal
+internal/**/*_test.go
+internal/testutil

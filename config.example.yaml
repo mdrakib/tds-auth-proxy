@@ -1,0 +1,104 @@
+# tds-auth-proxy reference configuration.
+#
+# Secrets never live in this file: backend passwords come from files (or
+# environment variables), client passwords are stored only as Argon2id hashes
+# (create one with: printf '%s\n' 'the-password' | tds-proxy hash-password).
+#
+# Reload without restart: SIGHUP (docker compose kill -s HUP tds-proxy) or
+# POST http://127.0.0.1:8080/-/reload. Reloads apply to users, credential
+# profiles, backends, allowlists, TLS certificates and log level. Listener
+# addresses, max_connections and admin.listen need a restart.
+
+server:
+  max_connections: 200          # concurrent client connections (incl. handshakes)
+  handshake_timeout: 15s        # accept -> login response relayed
+  idle_timeout: 30m             # no bytes in either direction; 0 disables.
+                                # NB: a single query running longer than this
+                                # without returning data is also cut off.
+  shutdown_timeout: 20s         # on SIGTERM, wait this long for sessions to end
+  auth_failure_delay: 1s        # delay before reporting a failed login
+  max_concurrent_hashes: 4      # parallel Argon2id verifications (~19 MiB each by default)
+  allowed_cidrs: []             # e.g. [10.8.0.0/24] (WireGuard); empty = any
+
+logging:
+  level: info                   # debug | info | warn | error
+
+admin:
+  listen: "127.0.0.1:8080"      # /healthz /readyz /metrics POST /-/reload; "" disables
+
+# One port per backend. An address without a host ("14331") binds 127.0.0.1.
+# In a container use 0.0.0.0 and restrict exposure with the published port.
+listeners:
+  - name: production-a
+    listen: "0.0.0.0:14331"
+    backend: sql-a
+  - name: production-b
+    listen: "0.0.0.0:14332"
+    backend: sql-b
+  - name: reporting
+    listen: "0.0.0.0:14333"
+    backend: sql-reporting
+    allowed_cidrs: [10.8.0.0/24]
+
+client_auth:
+  users:
+    - username: developer1                     # matched case-insensitively
+      password_hash_file: /run/secrets/developer1.hash
+      enabled: true
+      allowed_backends: [sql-a, sql-b]         # omit for all backends
+    - username: developer2
+      password_hash_env: PROXY_USER2_HASH      # '$' must be escaped as '$$' in compose files
+      allowed_backends: [sql-reporting]
+    - username: contractor
+      password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$ZmFrZWhhc2hmb3JleGFtcGxlb25seXJlcGxhY2VtZQ"
+      enabled: false
+
+# Backend credentials. Several backends may share one profile: update its
+# password file once and every new connection to all of them uses it.
+credential_profiles:
+  shared-ad:
+    type: ntlm
+    domain: MYDOMAIN
+    username: serviceuser                      # without domain prefix
+    password_file: /run/secrets/mssql-password
+    # channel_binding: true                    # Extended Protection (default on)
+    # workstation: TDSPROXY
+
+  reporting-sql:
+    type: sql
+    username: report_user
+    password_file: /run/secrets/reporting-password
+
+  # kerberos-example:
+  #   type: kerberos
+  #   username: serviceuser
+  #   realm: MYDOMAIN.EXAMPLE.COM
+  #   password_file: /run/secrets/mssql-password   # or keytab_file / credential_cache_file
+  #   krb5_config: /etc/krb5.conf
+  #   # spn: MSSQLSvc/sql-a.internal:1433           # default MSSQLSvc/<host>:<port>
+
+backends:
+  sql-a:
+    host: sql-a.internal
+    port: 1433
+    credentials: shared-ad
+  sql-b:
+    host: sql-b.internal
+    port: 1433
+    credentials: shared-ad
+  sql-reporting:
+    host: reporting.internal
+    port: 1433
+    credentials: reporting-sql
+    # connect_timeout: 10s
+    # tls_server_name: reporting.corp.example   # name expected in the certificate
+    # ca_file: /certs/corp-ca.crt               # overrides tls.backend_ca_file
+    # verify_certificate: false                 # INSECURE; only for testing
+
+tls:
+  client_certificate: /certs/proxy.crt         # presented to clients (reloadable)
+  client_private_key: /certs/proxy.key
+  min_version: "1.2"
+  max_version: "1.2"                           # TDS 7.x clients/servers generally require 1.2
+  backend_verify_certificate: true
+  # backend_ca_file: /certs/corp-ca.crt        # default: system trust store

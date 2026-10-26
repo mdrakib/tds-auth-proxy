@@ -1,0 +1,38 @@
+# DEVELOPMENT configuration used by docker-compose.yml. Paths are inside the
+# proxy container. See config.example.yaml for the production reference.
+server:
+  max_connections: 100
+  handshake_timeout: 15s
+  idle_timeout: 0s
+  shutdown_timeout: 20s
+logging:
+  level: info
+admin:
+  # Inside the container; published to the host on 127.0.0.1 only.
+  listen: "0.0.0.0:8080"
+listeners:
+  # Inside a container the listener must bind 0.0.0.0; the compose file
+  # publishes it on the host's loopback interface only.
+  - name: dev-sql
+    listen: "0.0.0.0:14331"
+    backend: dev-sql
+client_auth:
+  users:
+    - username: developer1
+      password_hash_file: /run/secrets/developer1.hash
+      enabled: true
+credential_profiles:
+  dev-sql-login:
+    type: sql
+    username: proxy_svc
+    password_file: /run/secrets/mssql-password
+backends:
+  dev-sql:
+    host: mssql
+    port: 1433
+    credentials: dev-sql-login
+tls:
+  client_certificate: /certs/proxy.crt
+  client_private_key: /certs/proxy.key
+  backend_verify_certificate: true
+  backend_ca_file: /certs/ca.crt
