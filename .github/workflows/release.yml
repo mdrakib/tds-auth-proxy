@@ -28,20 +28,17 @@ jobs:
       - run: go vet ./...
       - run: go test -race -count=1 ./...
 
-  build:
+  # One job builds every target and uploads straight to the Release. No
+  # intermediate workflow artifacts are used, so the account's Actions
+  # artifact-storage quota does not apply (release assets are stored separately).
+  release:
     needs: test
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - {goos: windows, goarch: amd64}
-          - {goos: windows, goarch: arm64}
-          - {goos: linux, goarch: amd64}
-          - {goos: linux, goarch: arm64}
-          - {goos: darwin, goarch: amd64}
-          - {goos: darwin, goarch: arm64}
+    permissions:
+      contents: write
     env:
       TAG: ${{ inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -51,46 +48,32 @@ jobs:
           go-version-file: go.mod
       - name: Build
         env:
-          GOOS: ${{ matrix.goos }}
-          GOARCH: ${{ matrix.goarch }}
           CGO_ENABLED: "0"
         run: |
           set -eu
-          name="tds-proxy_${TAG}_${GOOS}_${GOARCH}"
-          ext=""; [ "$GOOS" = windows ] && ext=".exe"
-          mkdir -p "dist/$name"
-          go build -trimpath -ldflags "-s -w -X main.version=${TAG}" -o "dist/$name/tds-proxy$ext" ./cmd/tds-proxy
-          cp README.md config.example.yaml "dist/$name/"
-          cd dist
-          if [ "$GOOS" = windows ]; then zip -qr "$name.zip" "$name"; else tar -czf "$name.tar.gz" "$name"; fi
-          rm -rf "$name"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: tds-proxy-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/*
-
-  publish:
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    env:
-      TAG: ${{ inputs.tag || github.ref_name }}
-      GH_TOKEN: ${{ github.token }}
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-      - name: Checksums
-        run: cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
+          mkdir -p dist
+          for target in windows/amd64 windows/arm64 linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            export GOOS="${target%/*}" GOARCH="${target#*/}"
+            name="tds-proxy_${TAG}_${GOOS}_${GOARCH}"
+            ext=""; [ "$GOOS" = windows ] && ext=".exe"
+            mkdir -p "dist/$name"
+            go build -trimpath -ldflags "-s -w -X main.version=${TAG}" -o "dist/$name/tds-proxy$ext" ./cmd/tds-proxy
+            cp README.md config.example.yaml "dist/$name/"
+            if [ "$GOOS" = windows ]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+            fi
+            rm -rf "dist/$name"
+          done
+          (cd dist && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt)
       - name: Create or update the GitHub Release
         run: |
           set -eu
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
           else
             pre=""
             case "$TAG" in *-*) pre="--prerelease";; esac   # v0.1.0-rc1 -> pre-release
-            gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "tds-proxy $TAG" --generate-notes ${pre:+"$pre"}
+            gh release create "$TAG" dist/* --verify-tag --title "tds-proxy $TAG" --generate-notes ${pre:+"$pre"}
           fi
