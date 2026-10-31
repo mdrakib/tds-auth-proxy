@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 
@@ -55,8 +56,18 @@ func New(path string, logger *slog.Logger, level *slog.LevelVar) (*App, error) {
 			logger.Info("backend logins resumed for credential profile", "event", "backend_credentials_unblocked", "profile", profile)
 		}
 	}
-	handler := &session.Handler{State: a.state.Load, Metrics: a.Metrics, Logger: logger, Guard: a.guard}
-	a.srv = &listener.Server{Handler: handler, Metrics: a.Metrics, Logger: logger}
+	handler := &session.Handler{
+		Settings:   func() session.Settings { return a.state.Load().Settings() },
+		Authorizer: &session.ConfigAuthorizer{State: a.state.Load, Metrics: a.Metrics, Guard: a.guard},
+		Metrics:    a.Metrics,
+		Logger:     logger,
+	}
+	a.srv = &listener.Server{
+		Handler: handler, Metrics: a.Metrics, Logger: logger,
+		Allowed: func(name string, addr netip.Addr) bool { return a.state.Load().Allowed(name, addr) },
+		// Applied once; a change requires a restart (see warnRestartRequired).
+		MaxConnections: cfg.Server.MaxConnections,
+	}
 	a.admin = &monitoring.AdminServer{Metrics: a.Metrics, Ready: &a.ready, Reload: a.Reload, Logger: logger}
 	return a, nil
 }
@@ -80,7 +91,11 @@ func (a *App) Start() error {
 		}
 		a.logger.Info("admin server listening", "address", addr)
 	}
-	if err := a.srv.Listen(a.state.Load()); err != nil {
+	var addrs []listener.Address
+	for _, l := range cfg.Listeners {
+		addrs = append(addrs, listener.Address{Name: l.Name, Address: l.Listen, Backend: l.Backend})
+	}
+	if err := a.srv.Listen(addrs); err != nil {
 		a.admin.Shutdown(context.Background())
 		return err
 	}

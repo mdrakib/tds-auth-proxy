@@ -30,8 +30,8 @@ func TestCheckClientLogin(t *testing.T) {
 	for name, mut := range cases {
 		l := baseLogin()
 		mut(l)
-		var se *sessionError
-		if err := checkClientLogin(l); !errors.As(err, &se) || se.clientNum != errLoginFailed {
+		var se *LoginFailure
+		if err := checkClientLogin(l); !errors.As(err, &se) || se.Number != errLoginFailed {
 			t.Errorf("%s: got %v", name, err)
 		}
 	}

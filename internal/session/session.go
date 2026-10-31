@@ -13,9 +13,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/netip"
 	"time"
 
-	"github.com/mdrakib/tds-auth-proxy/internal/auth"
 	"github.com/mdrakib/tds-auth-proxy/internal/backend"
 	"github.com/mdrakib/tds-auth-proxy/internal/credentials"
 	"github.com/mdrakib/tds-auth-proxy/internal/monitoring"
@@ -31,48 +31,152 @@ const (
 
 // Handler serves client connections. It is safe for concurrent use.
 type Handler struct {
-	State   func() *State
-	Metrics *monitoring.Metrics
-	Logger  *slog.Logger
-	// Guard pauses logins with rejected backend credentials; nil disables it.
-	Guard *credentials.Guard
+	// Settings returns the settings for a new session; it is called once
+	// per connection.
+	Settings func() Settings
+	// Authorizer authenticates each client login and chooses its backend.
+	Authorizer Authorizer
+	Metrics    *monitoring.Metrics
+	Logger     *slog.Logger
+	// OnOpen and OnClose, if set, are called for every session whose
+	// backend login succeeded.
+	OnOpen  func(SessionInfo)
+	OnClose func(SessionInfo, CloseInfo)
 }
 
-// sessionError is a failure during the login phase. clientMsg is what the
-// client is told (generic); the wrapped error goes to the log only.
-type sessionError struct {
-	category  string
-	clientNum int32
-	clientMsg string
-	err       error
+// Settings are the per-session parameters that do not depend on the client.
+type Settings struct {
+	ClientTLS        *tls.Config
+	HandshakeTimeout time.Duration
+	IdleTimeout      time.Duration
+	AuthFailureDelay time.Duration
+	// LoginOnlyEncryption answers a client that offers ENCRYPT_OFF the way
+	// SQL Server does: TLS protects the LOGIN7 (and so the password), then
+	// the session continues unencrypted. Clients asking for encryption still
+	// get full TLS. Off: such clients are told encryption is required.
+	LoginOnlyEncryption bool
+	// AllowUnencrypted accepts clients that do not support encryption
+	// (ENCRYPT_NOT_SUP) with no TLS at all, as SQL Server does without
+	// forced encryption. Their LOGIN7, password included, travels in clear.
+	// Off: such clients are refused.
+	AllowUnencrypted bool
 }
 
-func (e *sessionError) Error() string { return e.category + ": " + e.err.Error() }
-func (e *sessionError) Unwrap() error { return e.err }
+// clientEncryption is what was negotiated with the client.
+type clientEncryption int
 
-func fail(category string, num int32, msg string, err error) *sessionError {
-	return &sessionError{category: category, clientNum: num, clientMsg: msg, err: err}
+const (
+	encFull      clientEncryption = iota // TLS for the whole session
+	encLoginOnly                         // TLS for LOGIN7 only
+	encNone                              // no TLS
+)
+
+// ClientLogin is a client's validated LOGIN7, handed to the Authorizer.
+type ClientLogin struct {
+	Listener string
+	User     string
+	Password string // cleared after Authorize returns
+	AppName  string
+	HostName string
+	Database string
+	Addr     netip.Addr
+	// Log carries the connection's context (connection id, listener, client).
+	Log *slog.Logger
 }
+
+// Grant is a successful authorization: where to log in, and with what.
+type Grant struct {
+	// User is the client identity for logs.
+	User   string
+	Target backend.Target
+	Creds  credentials.Credentials
+	// Done, if set, is called exactly once with the outcome of the backend
+	// login (nil on success), including when the session is abandoned.
+	Done func(err error)
+}
+
+// Authorizer decides whether a client login may proceed. Returning a
+// *LoginFailure controls what the client is told; any other error is
+// reported as a generic "Login failed for user" (18456).
+type Authorizer interface {
+	Authorize(ctx context.Context, l *ClientLogin) (*Grant, error)
+}
+
+// SessionInfo describes an established session.
+type SessionInfo struct {
+	ID          string
+	Listener    string
+	ClientUser  string
+	ClientAddr  netip.Addr
+	ClientApp   string
+	ClientHost  string
+	Backend     string
+	BackendUser string
+	BackendSPID uint16
+	Database    string
+	Started     time.Time
+}
+
+// CloseInfo describes how a session ended.
+type CloseInfo struct {
+	Reason       string
+	Duration     time.Duration
+	ClientToBack int64
+	BackToClient int64
+	Err          error
+}
+
+// ErrAbandoned is passed to Grant.Done when the session ended before the
+// backend login produced an outcome.
+var ErrAbandoned = errors.New("session abandoned before the backend login completed")
+
+// LoginFailure is a failure during the login phase. Message is what the
+// client is told (generic); Err goes to the log only. Number 0 closes the
+// connection without an error token.
+type LoginFailure struct {
+	Category string
+	Number   int32
+	Message  string
+	Err      error
+}
+
+func (e *LoginFailure) Error() string { return e.Category + ": " + e.Err.Error() }
+func (e *LoginFailure) Unwrap() error { return e.Err }
+
+// Fail returns a *LoginFailure.
+func Fail(category string, num int32, msg string, err error) *LoginFailure {
+	return &LoginFailure{Category: category, Number: num, Message: msg, Err: err}
+}
+
+func fail(category string, num int32, msg string, err error) *LoginFailure {
+	return Fail(category, num, msg, err)
+}
+
+// LoginFailedMessage is the generic message for a rejected client login.
+func LoginFailedMessage(user string) string { return loginFailedMsg(user) }
 
 // conn is the per-connection state.
 type conn struct {
 	h        *Handler
-	st       *State
+	set      Settings
 	id       string
 	listener string
 	raw      net.Conn
 	log      *slog.Logger
 	start    time.Time
 	tls      *tls.Conn // client TLS session, once established
-	user     string    // client-supplied username, for error messages
+	// client carries everything after LOGIN7: tls, or the plain connection
+	// when only the login was encrypted. Nil until LOGIN7 was read.
+	client net.Conn
+	user   string // client-supplied username, for error messages
 }
 
 // Handle runs a client session to completion and closes raw.
 func (h *Handler) Handle(ctx context.Context, raw net.Conn, listener string) {
-	st := h.State()
+	set := h.Settings()
 	c := &conn{
 		h:        h,
-		st:       st,
+		set:      set,
 		id:       newID(),
 		listener: listener,
 		raw:      raw,
@@ -87,9 +191,9 @@ func (h *Handler) Handle(ctx context.Context, raw net.Conn, listener string) {
 
 	c.log.Debug("connection accepted", "event", "connection_accepted")
 
-	hsCtx, cancel := context.WithTimeout(ctx, st.Config.Server.HandshakeTimeout)
+	hsCtx, cancel := context.WithTimeout(ctx, set.HandshakeTimeout)
 	defer cancel()
-	raw.SetDeadline(time.Now().Add(st.Config.Server.HandshakeTimeout))
+	raw.SetDeadline(time.Now().Add(set.HandshakeTimeout))
 	// Unblock any pending read on shutdown or handshake timeout.
 	stop := context.AfterFunc(hsCtx, func() { raw.SetDeadline(time.Unix(1, 0)) })
 
@@ -116,6 +220,14 @@ func (h *Handler) Handle(ctx context.Context, raw net.Conn, listener string) {
 	handshake := time.Since(c.start)
 	h.Metrics.HandshakeDuration.Observe(handshake)
 	c.log = c.log.With("client_user", be.user, "backend", be.backend, "backend_user", be.identity, "backend_spid", be.sess.SPID)
+	info := SessionInfo{
+		ID: c.id, Listener: listener, ClientUser: be.user, ClientAddr: remoteAddr(raw),
+		ClientApp: be.app, ClientHost: be.host, Backend: be.backend, BackendUser: be.identity,
+		BackendSPID: be.sess.SPID, Database: be.sess.Database, Started: c.start,
+	}
+	if h.OnOpen != nil {
+		h.OnOpen(info)
+	}
 	c.log.Info("connection established",
 		"event", "connection_established",
 		"handshake_ms", handshake.Milliseconds(),
@@ -125,8 +237,11 @@ func (h *Handler) Handle(ctx context.Context, raw net.Conn, listener string) {
 		"server_version", fmt.Sprintf("%d.%d.%d", be.sess.Ack.Version[0], be.sess.Ack.Version[1], int(be.sess.Ack.Version[2])<<8|int(be.sess.Ack.Version[3])),
 	)
 
-	res := relay.Run(ctx, c.tls, be.sess.Conn, c.st.Config.Server.IdleTimeout, h.Metrics)
+	res := relay.Run(ctx, c.client, be.sess.Conn, c.set.IdleTimeout, h.Metrics)
 	dur := time.Since(c.start)
+	if h.OnClose != nil {
+		h.OnClose(info, CloseInfo{Reason: res.Reason, Duration: dur, ClientToBack: res.ClientToBack, BackToClient: res.BackToClient, Err: res.Err})
+	}
 	h.Metrics.SessionDuration.Observe(dur)
 	attrs := []any{
 		"event", "connection_closed",
@@ -146,6 +261,8 @@ type established struct {
 	user     string
 	backend  string
 	identity string
+	app      string
+	host     string
 	mars     bool
 }
 
@@ -161,22 +278,31 @@ func (c *conn) establish(ctx context.Context) (*established, error) {
 	// Put the sniffed byte back in front of the stream.
 	pre := &prefixConn{Conn: c.raw, prefix: first}
 
-	mars, err := c.prelogin(pre)
+	mars, enc, err := c.prelogin(pre)
 	if err != nil {
 		return nil, err
 	}
 
-	hc := protocol.NewHandshakeConn(pre)
-	tc := tls.Server(hc, c.st.ClientTLS)
-	if err := tc.HandshakeContext(ctx); err != nil {
-		return nil, fail("client_tls", 0, "", fmt.Errorf("TLS handshake: %w", err))
+	var loginConn net.Conn = pre
+	if enc != encNone {
+		hc := protocol.NewHandshakeConn(pre)
+		tc := tls.Server(hc, c.set.ClientTLS)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			return nil, fail("client_tls", 0, "", fmt.Errorf("TLS handshake: %w", err))
+		}
+		if err := hc.EndHandshake(); err != nil {
+			return nil, fail("client_tls", 0, "", fmt.Errorf("TLS handshake: %w", err))
+		}
+		c.tls, loginConn = tc, tc
 	}
-	if err := hc.EndHandshake(); err != nil {
-		return nil, fail("client_tls", 0, "", fmt.Errorf("TLS handshake: %w", err))
-	}
-	c.tls = tc
 
-	msg, err := protocol.ReadMessage(tc, protocol.MaxPacketSize, protocol.MaxLogin7Size)
+	msg, err := protocol.ReadMessage(loginConn, protocol.MaxPacketSize, protocol.MaxLogin7Size)
+	// With login-only encryption TLS ends after LOGIN7: the client sends and
+	// expects everything else in clear, starting with the login response.
+	c.client = loginConn
+	if enc == encLoginOnly {
+		c.client = pre
+	}
 	if err != nil {
 		return nil, fail("client_protocol", 0, "", fmt.Errorf("reading LOGIN7: %w", err))
 	}
@@ -191,122 +317,92 @@ func (c *conn) establish(ctx context.Context) (*established, error) {
 	c.user = login.UserName
 	c.log = c.log.With("client_app", login.AppName, "client_host", login.HostName)
 
-	// Authenticate and authorize against the configuration current now, not
-	// the one at accept time: a client stalling its handshake must not
-	// benefit from users, grants or profiles a reload has since removed.
-	c.st = c.h.State()
-
 	if err := checkClientLogin(login); err != nil {
 		return nil, err
 	}
 
-	// Authentication.
-	password := login.Password
+	// Authentication, authorization and the backend choice.
+	cl := &ClientLogin{
+		Listener: c.listener, User: login.UserName, Password: login.Password,
+		AppName: login.AppName, HostName: login.HostName, Database: login.Database,
+		Addr: remoteAddr(c.raw), Log: c.log,
+	}
 	login.Password = ""
-	u, err := c.st.Auth.Authenticate(ctx, login.UserName, password)
-	password = ""
-	if err != nil && ctx.Err() != nil {
-		return nil, fail("handshake_timeout", 0, "", err)
-	}
+	g, err := c.h.Authorizer.Authorize(ctx, cl)
+	cl.Password = ""
 	if err != nil {
-		outcome := "invalid_credentials"
-		if errors.Is(err, auth.ErrUserDisabled) {
-			outcome = "disabled"
+		if ctx.Err() != nil {
+			return nil, fail("handshake_timeout", 0, "", err)
 		}
-		c.h.Metrics.AuthResult(outcome)
-		return nil, fail("client_auth_"+outcome, errLoginFailed, loginFailedMsg(login.UserName), err)
+		var lf *LoginFailure
+		if errors.As(err, &lf) {
+			return nil, lf
+		}
+		return nil, fail("client_auth", errLoginFailed, loginFailedMsg(login.UserName), err)
 	}
+	c.log.Info("client authenticated", "event", "client_authenticated", "client_user", g.User, "backend", g.Target.Name)
 
-	// Authorization.
-	l := c.st.Listeners[c.listener]
-	b, ok := c.st.Backends[l.Backend]
-	if !ok {
-		return nil, fail("config", errLoginFailed, loginFailedMsg(login.UserName), fmt.Errorf("listener backend %q not configured", l.Backend))
-	}
-	if !u.MayAccess(l.Backend) {
-		c.h.Metrics.AuthResult("unauthorized")
-		return nil, fail("client_unauthorized", errLoginFailed, loginFailedMsg(login.UserName),
-			fmt.Errorf("user %q is not authorized for backend %q", u.Name, l.Backend))
-	}
-	c.h.Metrics.AuthResult("success")
-	c.log.Info("client authenticated", "event", "client_authenticated", "client_user", u.Name, "backend", l.Backend)
-
-	// Backend login with current credentials.
-	creds, err := c.st.Creds.GetCredentials(ctx, b.Profile)
-	if err != nil {
-		c.h.Metrics.BackendFailure(b.Name, "credentials")
-		return nil, fail("backend_credentials", errLoginFailed, backendFailedMsg(b.Name), err)
-	}
-	var ticket *credentials.Ticket
-	if lp := c.st.Config.Server.LockoutProtection; c.h.Guard != nil && lp.IsEnabled() {
-		ticket, err = c.h.Guard.Acquire(ctx, b.Profile, creds, lp.MaxParallelLogins, lp.RetryInterval)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, fail("handshake_timeout", 0, "", fmt.Errorf("waiting for backend credential check: %w", err))
-			}
-			c.h.Metrics.BackendFailure(b.Name, "credentials_blocked")
-			c.log = c.log.With("client_user", u.Name, "backend", b.Name, "backend_user", creds.Identity())
-			return nil, fail("backend_credentials_blocked", errLoginFailed,
-				fmt.Sprintf("Login failed: the proxy's credentials for backend server '%s' were rejected and it is waiting for a new password. Contact the proxy administrator.", b.Name), err)
+	// Backend login. Done is reported exactly once, even if Connect panics.
+	reported := false
+	report := func(err error) {
+		if !reported && g.Done != nil {
+			reported = true
+			g.Done(err)
 		}
 	}
-	// Releases the login slot even if Connect panics; a no-op after Done.
-	defer ticket.Done(credentials.Inconclusive)
-	up := upstreamLogin(login, b.Host)
-	sess, err := backend.Connect(ctx, b.Target, creds, up, mars)
-	outcome := credentials.Accepted
-	if err != nil {
-		outcome = credentials.Inconclusive
-		if backend.CredentialsRejected(err) {
-			outcome = credentials.Rejected
-		}
-	}
-	if ticket.Done(outcome) {
-		c.log.Error("backend rejected the proxy's credentials; new logins with them are paused until the secret changes",
-			"event", "backend_credentials_blocked",
-			"backend", b.Name, "profile", b.Profile, "backend_user", creds.Identity(), "error", err.Error())
-	}
+	defer report(ErrAbandoned)
+	up := upstreamLogin(login, g.Target.Host)
+	sess, err := backend.Connect(ctx, g.Target, g.Creds, up, mars)
+	report(err)
 	if err != nil {
 		cat, num := backendCategory(err)
-		c.h.Metrics.BackendFailure(b.Name, cat)
-		c.log = c.log.With("client_user", u.Name, "backend", b.Name, "backend_user", creds.Identity())
-		msg := backendFailedMsg(b.Name)
+		c.h.Metrics.BackendFailure(g.Target.Name, cat)
+		c.log = c.log.With("client_user", g.User, "backend", g.Target.Name, "backend_user", g.Creds.Identity())
+		msg := backendFailedMsg(g.Target.Name)
 		if num == errServerUnavailable {
-			msg = fmt.Sprintf("The proxy could not reach backend server '%s'.", b.Name)
+			msg = fmt.Sprintf("The proxy could not reach backend server '%s'.", g.Target.Name)
 		}
 		return nil, fail("backend_"+cat, num, msg, err)
 	}
 
 	// Relay the backend's genuine login response.
 	pktSize := min(protocol.DefaultPacketSize, sess.PacketSize)
-	if err := protocol.WriteMessage(tc, protocol.PacketReply, sess.SPID, sess.Response, pktSize); err != nil {
+	if err := protocol.WriteMessage(c.client, protocol.PacketReply, sess.SPID, sess.Response, pktSize); err != nil {
 		sess.Conn.Close()
 		return nil, fail("client_io", 0, "", fmt.Errorf("sending login response: %w", err))
 	}
-	return &established{sess: sess, user: u.Name, backend: b.Name, identity: creds.Identity(), mars: mars}, nil
+	return &established{sess: sess, user: g.User, backend: g.Target.Name, identity: g.Creds.Identity(),
+		app: login.AppName, host: login.HostName, mars: mars}, nil
 }
 
-// prelogin answers the client's PRELOGIN. Encryption is always required:
-// a client offering OFF is told REQ (full encryption), and a client that
-// does not support encryption is refused.
-func (c *conn) prelogin(rw net.Conn) (mars bool, err error) {
+// prelogin answers the client's PRELOGIN. A client offering OFF is told REQ
+// (full encryption), or with LoginOnlyEncryption OFF, which encrypts only its
+// LOGIN7, as SQL Server does without forced encryption. A client that does
+// not support encryption is refused, or with AllowUnencrypted told NOT_SUP
+// and served without TLS.
+func (c *conn) prelogin(rw net.Conn) (mars bool, enc clientEncryption, err error) {
 	msg, err := protocol.ReadMessage(rw, protocol.MaxPacketSize, protocol.MaxPreloginSize)
 	if err != nil {
-		return false, fail("client_protocol", 0, "", fmt.Errorf("reading PRELOGIN: %w", err))
+		return false, encFull, fail("client_protocol", 0, "", fmt.Errorf("reading PRELOGIN: %w", err))
 	}
 	if msg.Type != protocol.PacketPrelogin {
-		return false, fail("client_protocol", 0, "", fmt.Errorf("expected PRELOGIN, got packet type 0x%02x", msg.Type))
+		return false, encFull, fail("client_protocol", 0, "", fmt.Errorf("expected PRELOGIN, got packet type 0x%02x", msg.Type))
 	}
 	req, err := protocol.ParsePrelogin(msg.Payload)
 	if err != nil {
-		return false, fail("client_protocol", 0, "", err)
+		return false, encFull, fail("client_protocol", 0, "", err)
 	}
-	enc, ok := req.Encryption()
+	offered, ok := req.Encryption()
 	if !ok {
-		enc = protocol.EncryptOff
+		offered = protocol.EncryptOff
 	}
 	respEnc := protocol.EncryptOn
-	if enc == protocol.EncryptOff || enc == protocol.EncryptNotSup {
+	switch {
+	case offered == protocol.EncryptOff && c.set.LoginOnlyEncryption:
+		respEnc, enc = protocol.EncryptOff, encLoginOnly
+	case offered == protocol.EncryptNotSup && c.set.AllowUnencrypted:
+		respEnc, enc = protocol.EncryptNotSup, encNone
+	case offered == protocol.EncryptOff || offered == protocol.EncryptNotSup:
 		respEnc = protocol.EncryptReq
 	}
 	mars = req.MARS()
@@ -325,12 +421,12 @@ func (c *conn) prelogin(rw net.Conn) (mars bool, err error) {
 		resp.Options = append(resp.Options, protocol.PreloginOption{Token: protocol.PreloginFedAuthRequired, Data: []byte{0}})
 	}
 	if err := protocol.WriteMessage(rw, protocol.PacketReply, 0, resp.Marshal(), protocol.DefaultPacketSize); err != nil {
-		return false, fail("client_io", 0, "", err)
+		return false, encFull, fail("client_io", 0, "", err)
 	}
-	if enc == protocol.EncryptNotSup {
-		return false, fail("client_no_encryption", 0, "", errors.New("client does not support encryption"))
+	if offered == protocol.EncryptNotSup && enc != encNone {
+		return false, encFull, fail("client_no_encryption", 0, "", errors.New("client does not support encryption"))
 	}
-	return mars, nil
+	return mars, enc, nil
 }
 
 // checkClientLogin rejects login requests the proxy cannot honour.
@@ -422,24 +518,24 @@ func backendFailedMsg(name string) string {
 // loginFailed logs a login-phase failure and, when the client is far enough
 // along to understand a token stream, sends it a generic error.
 func (c *conn) loginFailed(ctx context.Context, err error) {
-	var se *sessionError
+	var se *LoginFailure
 	if !errors.As(err, &se) {
 		se = fail("internal", errLoginFailed, loginFailedMsg(c.user), err)
 	}
 	if isTimeout(err) {
-		se.category = "handshake_timeout"
+		se.Category = "handshake_timeout"
 	}
 	c.log.Warn("login failed",
 		"event", "login_failed",
-		"category", se.category,
+		"category", se.Category,
 		"client_user_attempted", truncate(c.user, 128),
-		"error", se.err.Error(),
+		"error", se.Err.Error(),
 		"elapsed_ms", time.Since(c.start).Milliseconds(),
 	)
-	if c.tls == nil || se.clientNum == 0 {
+	if c.client == nil || se.Number == 0 {
 		return
 	}
-	if d := c.st.Config.Server.AuthFailureDelay; d > 0 && se.clientNum == errLoginFailed {
+	if d := c.set.AuthFailureDelay; d > 0 && se.Number == errLoginFailed {
 		t := time.NewTimer(d)
 		select {
 		case <-t.C:
@@ -448,9 +544,9 @@ func (c *conn) loginFailed(ctx context.Context, err error) {
 		}
 	}
 	c.raw.SetDeadline(time.Now().Add(5 * time.Second))
-	payload := protocol.ErrorToken(se.clientNum, 1, 14, se.clientMsg, c.listener)
+	payload := protocol.ErrorToken(se.Number, 1, 14, se.Message, c.listener)
 	payload = append(payload, protocol.DoneToken(protocol.DoneError)...)
-	protocol.WriteMessage(c.tls, protocol.PacketReply, 0, payload, protocol.DefaultPacketSize)
+	protocol.WriteMessage(c.client, protocol.PacketReply, 0, payload, protocol.DefaultPacketSize)
 }
 
 func isTimeout(err error) bool {
@@ -471,6 +567,13 @@ func newID() string {
 	var b [8]byte
 	rand.Read(b[:])
 	return hex.EncodeToString(b[:])
+}
+
+func remoteAddr(c net.Conn) netip.Addr {
+	if ap, err := netip.ParseAddrPort(c.RemoteAddr().String()); err == nil {
+		return ap.Addr().Unmap()
+	}
+	return netip.Addr{}
 }
 
 func remoteIP(c net.Conn) string {

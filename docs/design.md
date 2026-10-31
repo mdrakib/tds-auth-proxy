@@ -128,11 +128,36 @@ internal/session      per-connection state machine and immutable State
 internal/relay        frame-aware bidirectional relay
 internal/listener     listeners, connection limit, allowlists, graceful shutdown
 internal/monitoring   metrics, /healthz /readyz /metrics /-/reload
+tdsproxy              public embedding API: Server with runtime listeners, an
+                      Authorizer hook per client login, session open/close hooks
 internal/testutil     test PKI and an in-process fake SQL Server (verifies NTLMv2)
 tests/integration     real SQL Server suite (go-mssqldb)
 tests/clients         SqlClient (.NET) and mssql-jdbc suites
 tests/bench           direct-vs-proxy benchmark
 ```
+
+## Embedding (`tdsproxy`)
+
+Other Go programs can run the proxy in-process. `tdsproxy.Server` adds and
+removes named listeners at runtime (`Serve`, `Close`) and calls the host's
+`Authorizer` for every client login after LOGIN7 has been parsed and checked.
+The Authorizer authenticates the client however it likes and returns a `Grant`:
+the backend `Target` (with its TLS configuration) and the `Credentials` to log in
+with. `Grant.Done` receives the backend login outcome exactly once
+(`ErrAbandoned` if the session ended first), so the host runs its own lockout
+protection; `CredentialsRejected` and `BackendLoginError` classify the outcome.
+`Config.LoginOnlyEncryption` (off by default, and not offered by the
+standalone proxy) answers clients that offer no encryption the way SQL Server
+does without forced encryption: TLS for LOGIN7 only, then the session in
+clear. Clients asking for encryption always get full TLS, and the backend
+leg is always encrypted.
+`Config.AllowUnencrypted` (also off by default) accepts clients that do not
+support encryption at all with no TLS; their LOGIN7, password included,
+travels in clear.
+Everything after the Authorizer — backend login, response relay, frame-aware
+relay — is the same code the standalone proxy runs: `cmd/tds-proxy` uses the
+same handler, with `session.ConfigAuthorizer` (YAML users, profiles and
+`credentials.Guard`) as its Authorizer.
 
 ## Testing strategy
 

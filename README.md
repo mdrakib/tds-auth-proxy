@@ -338,6 +338,13 @@ the hash parameters and `max_concurrent_hashes`.
 
 Set `logging.level: debug` for per-connection detail (still no secrets).
 
+## Embedding in another Go program
+
+The package `github.com/mdrakib/tds-auth-proxy/tdsproxy` runs the same proxy
+in-process: listeners are added and removed at runtime, and the host program
+authenticates each client login and picks the backend and credentials through
+an `Authorizer` hook. See [docs/design.md](docs/design.md#embedding-tdsproxy).
+
 ## Development
 
 ```sh

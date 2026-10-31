@@ -3,5 +3,7 @@
 !go.sum
 !cmd
 !internal
+!tdsproxy
 internal/**/*_test.go
 internal/testutil
+tdsproxy/**/*_test.go
