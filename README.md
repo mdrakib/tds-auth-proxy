@@ -357,3 +357,7 @@ tests/clients/jdbc   # mssql-jdbc suite:                ./run.sh <port> <user> <
 
 Design notes, protocol decisions and the research behind them are in
 [`docs/design.md`](docs/design.md).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
